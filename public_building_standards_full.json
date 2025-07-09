@@ -1,0 +1,173 @@
+import re
+import json
+import PyPDF2
+
+def extract_text_from_pdf(pdf_path, max_pages=None):
+    """
+    指定されたPDFファイルからテキストを抽出します。
+    max_pagesで読み込む最大ページ数を制限できます (Noneの場合は全ページ)。
+    """
+    text = ""
+    try:
+        with open(pdf_path, 'rb') as file:
+            reader = PyPDF2.PdfReader(file)
+            pages_to_read = len(reader.pages) if max_pages is None else min(max_pages, len(reader.pages))
+            
+            for page_num in range(pages_to_read):
+                page = reader.pages[page_num]
+                extracted_page_text = page.extract_text()
+                
+                # ページフッターなどをここで除去
+                # PDFによってページ番号の形式が異なる場合があるため、複数のパターンを考慮
+                extracted_page_text = re.sub(r'-\s*\d+\s*-', '', extracted_page_text) # 例: - 1 -
+                extracted_page_text = re.sub(r'^\s*\d+\s*$', '', extracted_page_text, flags=re.MULTILINE) # 例: 1 (単独の行番号)
+                
+                extracted_page_text = re.sub(r'公共建築数量積算基準\(令和\d+年改定\)', '', extracted_page_text) # ヘッダーの除去
+                extracted_page_text = re.sub(r'^\s*最終改定令和\d+年\d+月\d+日国営積第\d+号\s*$', '', extracted_page_text, flags=re.MULTILINE)
+                extracted_page_text = re.sub(r'^\s*平成\d+年\d+月\d+日国営計第\d+号\s*$', '', extracted_page_text, flags=re.MULTILINE)
+                extracted_page_text = re.sub(r'^\s*この基準は、国土交通省官庁営繕部及び地方整備局等営繕部が官庁施設の営繕を実施.*?\s*統一基準です。\s*$', '', extracted_page_text, flags=re.S)
+                extracted_page_text = re.sub(r'^\s*利用にあたっては、国土交通省ホームページのリンク・著作権・免責事項に関する利.*?\s*ご確認ください。\s*$', '', extracted_page_text, flags=re.S)
+                extracted_page_text = re.sub(r'^\s*国土交通省大臣官房官庁営繕部\s*$', '', extracted_page_text)
+                extracted_page_text = re.sub(r'^\s*技術基準トップページはこちら.*?\s*html\s*$', '', extracted_page_text, flags=re.S)
+                
+                text += extracted_page_text + "\n--- PAGE_BREAK ---\n" # ページ間の区切りを明示的に追加
+    except FileNotFoundError:
+        print(f"エラー: 指定されたPDFファイル '{pdf_path}' が見つかりません。")
+        return None
+    except Exception as e:
+        print(f"PDFの読み込み中にエラーが発生しました: {e}")
+        return None
+    return text
+
+def parse_document(text):
+    """
+    抽出されたテキストから階層構造を解析し、辞書形式で返します。
+    """
+    data = {}
+    current_level_refs = [data] # 各階層の辞書オブジェクトをスタックのように保持
+    current_path_keys = [] # 各階層のキー名を保持
+
+    # 正規表現の定義（より具体的なものから順にチェックする）
+    # level: 階層の深さを示すインデックス (0: Part, 1: Chapter, 2: Section, 3: Item etc.)
+    re_patterns = [
+        ('part', re.compile(r"^(第\d+編\s+.*)$"), 0),
+        ('chapter', re.compile(r"^(第\d+章\s+.*)$"), 1),
+        ('section', re.compile(r"^(第\d+節\s+.*)$"), 2),
+        # 深い階層から順にチェック
+        ('sub_sub_sub_item', re.compile(r"^\s*(ア|イ|ウ|エ|オ|カ|キ|ク|ケ|コ)\)\s*(.*)$"), 6),
+        ('sub_sub_item', re.compile(r"^\s*(①|②|③|④|⑤|⑥|⑦|⑧|⑨|⑩)\s+(.*)$"), 5),
+        ('sub_numbered_item', re.compile(r"^\s*(\d+)\)\s*(.*)$"), 4), # 例: 1) 設計数量とは (ここが問題の箇所)
+        ('parenthesized_item', re.compile(r"^\s*（(\d+)）\s*(.*)$"), 3), # 全角括弧の数字（１）に対応
+        ('numbered_item', re.compile(r"^\s*(\d+)\s+(.*)$"), 3), # 半角数字 1. 通則
+    ]
+
+    # 除外する行のパターン
+    exclusion_re = re.compile(r"^\s*\(目次\)$|^\s*最終改定令和\d+年.*$|^平成\d+年\d+月\d+日国営計第\d+号$|^この基準は、国土交通省.*$|^利用にあたっては、国土交通省.*$|^国土交通省大臣官房官庁営繕部$|^技術基準トップページはこちら.*$|--- PAGE_BREAK ---")
+
+    lines = text.split('\n')
+
+    for line_raw in lines:
+        line = line_raw.strip()
+        if not line:
+            continue
+
+        # sourceタグの除去
+        line = re.sub(r"\\s*", "", line)
+        
+        # 除外する行のチェック
+        if exclusion_re.match(line):
+            continue
+
+        matched_type = None
+        matched_title = None
+        matched_level = -1
+
+        # 各パターンを優先順位に従ってチェック
+        for item_type, pattern, level in re_patterns:
+            match = pattern.match(line)
+            if match:
+                matched_type = item_type
+                if item_type == 'parenthesized_item':
+                    # 全角括弧の数字を半角に変換して統一
+                    num = match.group(1).translate(str.maketrans('０１２３４５６７８９', '0123456789'))
+                    matched_title = f"({num}){match.group(2).strip()}"
+                elif item_type == 'sub_sub_sub_item':
+                    # ア)イ)ウ)のようなパターンは、group(1)が「ア」などで、group(2)がタイトル
+                    matched_title = f"{match.group(1)}){match.group(2).strip()}"
+                elif item_type in ['sub_numbered_item', 'sub_sub_item']:
+                    matched_title = f"{match.group(1)}{match.group(2).strip()}"
+                else:
+                    matched_title = match.group(1).strip()
+                matched_level = level
+                break # 最初に見つかったパターンで処理を確定
+
+        if matched_type:
+            # 現在のパスを調整
+            while len(current_path_keys) > matched_level:
+                current_path_keys.pop()
+                current_level_refs.pop()
+            
+            # 新しいキーをパスと参照に追加
+            current_path_keys.append(matched_title)
+            
+            # 現在の親辞書に新しい項目を追加
+            current_parent_dict = current_level_refs[-1]
+            current_parent_dict[matched_title] = {}
+            current_level_refs.append(current_parent_dict[matched_title])
+            
+            # コンテンツリストを初期化
+            current_level_refs[-1]["content"] = []
+
+        else:
+            # どの見出しにもマッチしない場合、現在の最も深い階層の content に追加
+            if current_level_refs and "content" in current_level_refs[-1]:
+                current_level_refs[-1]["content"].append(line)
+            else:
+                # 文書冒頭のタイトルや説明文など、どの階層にも属さないテキストは無視
+                pass
+
+    # 最終的なコンテンツの結合とクリーンアップ
+    def clean_and_join_content(node):
+        if isinstance(node, dict):
+            if "content" in node and isinstance(node["content"], list):
+                # 複数行にまたがるコンテンツを1つの文字列にし、連続する空白を1つにまとめる
+                joined_content = " ".join(node["content"]).strip()
+                # 句読点（、。）の直後のスペースを削除する（全角スペース、半角スペース両方）
+                joined_content = re.sub(r'([、。])\s+', r'\1', joined_content)
+                joined_content = re.sub(r'\s+', ' ', joined_content) # 残りの複数の空白を1つに
+
+                if joined_content:
+                    node["content"] = joined_content
+                else:
+                    del node["content"] # contentが空の場合は削除
+            
+            # 再帰的に子ノードを処理
+            for key, value in list(node.items()): # イテレーション中に変更するためlist()でコピー
+                if isinstance(value, dict) and not value: # 空の辞書も削除
+                    del node[key]
+                else:
+                    clean_and_join_content(value)
+    
+    clean_and_join_content(data)
+
+    return data
+
+# --- メイン処理 ---
+if __name__ == "__main__":
+    pdf_path = "001178206.pdf" # ここにPDFファイルのパスを指定してください
+    
+    # 1. PDFからテキストを抽出（全ページ）
+    extracted_text = extract_text_from_pdf(pdf_path)
+
+    if extracted_text:
+        # 2. 抽出されたテキストを解析し、構造化
+        extracted_structured_data = parse_document(extracted_text)
+
+        # 3. 構造化されたデータをJSONとして出力
+        output_filename = "public_building_standards_structured_fixed.json"
+        try:
+            with open(output_filename, "w", encoding="utf-8") as f:
+                json.dump(extracted_structured_data, f, ensure_ascii=False, indent=4)
+            print(f"データが '{output_filename}' に正常に保存されました。")
+        except IOError as e:
+            print(f"ファイルの保存中にエラーが発生しました: {e}")
